@@ -156,6 +156,18 @@ async function connectFilesystem(){if(!port){setError('No serial port. Connect f
 async function disconnectFilesystem(){connected=false;if(reader){try{reader.releaseLock();}catch(e){}reader=null;}if(writer){try{writer.releaseLock();}catch(e){}writer=null;}}
 
 async function editFile(path,filename){if(!connected)return;setFilesystemStatus('Downloading '+filename+'...');const cs=512;readBuffer='';await sendCommand('storage read_chunks '+path+' '+cs);await waitForString('Size:',3000);await sleep(100);const sm=readBuffer.match(/Size:\s*(\d+)/);const size=sm?parseInt(sm[1]):0;const chunks=[];let received=0;while(received<size){await waitForString('Ready?',5000);await sleep(50);readBuffer='';await sendRaw('\r');await sleep(100);const eb=Math.min(cs,size-received);const st=Date.now();while(readBuffer.length<eb&&Date.now()-st<5000){await sleep(50);}chunks.push(readBuffer.substring(0,eb));received+=eb;readBuffer=readBuffer.substring(eb);}await waitForPrompt(3000);const content=chunks.join('');const nc=prompt('Edit file:',content);if(nc===null)return;setFilesystemStatus('Saving...');await sendCommand('storage remove '+path);await waitForPrompt(3000);const data=encoder.encode(nc);const ts=data.length;readBuffer='';await sendCommand('storage write_chunk '+path+' '+ts);if(!await waitForString('Ready',5000)){setFilesystemError('No Ready response');return;}await sleep(100);readBuffer='';const scs=512;let sent=0;while(sent<ts){await writer.write(data.slice(sent,Math.min(sent+scs,ts)));sent=Math.min(sent+scs,ts);await sleep(20);}await waitForPrompt(10000);setFilesystemStatus('Saved');await listDir(currentPath);}
+
+// ── Expose to global scope for onclick handlers ──
+window.selectBoard = selectBoard;
+window.handleConnect = handleConnect;
+window.goBack = goBack;
+window.setConnectState = setConnectState;
+window.showScreen = showScreen;
+window.uploadFile = uploadFile;
+window.createDir = createDir;
+window.listDir = listDir;
+window.disconnectFilesystem = disconnectFilesystem;
+window.getCurrentPath = () => currentPath;
 </script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box;}
@@ -265,7 +277,7 @@ h1{font-size:2rem;font-weight:700;color:#fff;margin-bottom:4px;letter-spacing:-0
     <div id="filesystem-status">Not connected</div>
     <div id="breadcrumb"></div>
     <div id="file-list"></div>
-    <div class="filesystem-controls"><button onclick="uploadFile()">UPLOAD</button><button onclick="createDir()">NEW DIR</button><button onclick="listDir(currentPath)">REFRESH</button></div>
+    <div class="filesystem-controls"><button onclick="uploadFile()">UPLOAD</button><button onclick="createDir()">NEW DIR</button><button onclick="listDir(getCurrentPath())">REFRESH</button></div>
     <br><button class="btn-back" onclick="disconnectFilesystem();goBack();">&larr; Back</button>
   </div>
 </div>
