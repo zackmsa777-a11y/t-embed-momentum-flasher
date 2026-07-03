@@ -85,6 +85,7 @@ h1{font-size:2rem;font-weight:700;color:#fff;margin-bottom:4px;letter-spacing:-0
       </div>
     </div>
     <p style="color:#555;font-size:0.78rem;margin-top:24px;">Firmware: m0lomalteser/Flipper-Zero-ESP32-Port (Momentum)<br>Commit: 9597c9e</p>
+    <a href="sdcard.zip" download style="display:inline-block;margin-top:16px;color:#ff8c00;font-size:0.85rem;text-decoration:none;border:1px solid #2a2a2a;padding:10px 20px;border-radius:8px;transition:all 0.2s;">Download SD Card Files (zip)</a>
   </div>
   <div id="screen-connect" class="screen">
     <p id="connect-info" class="connect-text">Connect your T-Embed via USB to get started.</p>
@@ -103,9 +104,11 @@ h1{font-size:2rem;font-weight:700;color:#fff;margin-bottom:4px;letter-spacing:-0
     <div class="success-text">Flashed!</div>
     <p class="success-sub">Momentum firmware installed successfully.<br>Your T-Embed is rebooting.</p><br>
     <div style="display:flex;gap:12px;flex-direction:column;">
+      <a href="sdcard.zip" download class="btn" style="text-decoration:none;min-width:260px;">Download SD Card Files</a>
       <button class="btn" onclick="setConnectState('filesystem');showScreen('screen-connect');">Manage SD Card Files</button>
       <button class="btn-back" onclick="goBack()">&larr; Flash Again</button>
     </div>
+    <p style="color:#666;font-size:0.8rem;margin-top:16px;line-height:1.5;">Download sdcard.zip, extract it, and copy the contents to a FAT32 SD card.<br>Insert the SD card into your T-Embed before using apps.</p>
   </div>
   <div id="screen-filesystem" class="screen">
     <h2>SD Card Filesystem</h2>
