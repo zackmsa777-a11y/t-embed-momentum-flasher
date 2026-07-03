@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>T-Embed Momentum Flasher</title>
+<script type="module">
+import { ESPLoader, Transport } from 'https://unpkg.com/esptool-js@0.5.4/bundle.js';
+
+const BOARDS = {
+  't-embed': {
+    name: 'LilyGo T-Embed CC1101',
+    chip: 'ESP32-S3',
+    flashSize: '16MB',
+    parts: [
+      { path: 'bootloader.bin', offset: 0x0 },
+      { path: 'partition-table.bin', offset: 0x8000 },
+      { path: 'ota_data_initial.bin', offset: 0xf000 },
+      { path: 'furi_esp32.bin', offset: 0x20000 },
+    ],
+  },
+};
+
+let selectedBoard = null;
+let port = null;
+let transport = null;
+let reader = null;
+let writer = null;
+let readBuffer = '';
+let currentPath = '/ext';
+let connected = false;
+
+const $ = id => document.getElementById(id);
+
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  $(id).classList.add('active');
+}
+
+function setError(msg) {
+  const el = $('error-banner');
+  if (msg) { el.textContent = msg; el.style.display = 'block'; }
+  else { el.style.display = 'none'; }
+}
+
+function selectBoard(key) {
+  selectedBoard = BOARDS[key];
+  setError(null);
+  document.querySelectorAll('.board-card').forEach(c => c.classList.remove('selected'));
+  $('board-' + key).classList.add('selected');
+  $('connect-info').textContent = 'Connect your ' + selectedBoard.name + ' via USB to get started.';
+  $('connect-chip').innerHTML = selectedBoard.chip + ' &bull; USB-C &bull; WebSerial';
+  $('connect-btn').disabled = false;
+  showScreen('screen-connect');
+}
+
+function setConnectState(state) {
+  const btn = $('connect-btn'), spinner = $('connect-spinner'), btnText = $('connect-text');
+  if (state === 'waiting') { btn.disabled = true; spinner.style.display = 'inline-block'; btnText.textContent = 'Waiting for device...'; }
+  else if (state === 'select') { btn.disabled = false; spinner.style.display = 'none'; btnText.textContent = 'Select device'; btn.classList.remove('flash-ready', 'filesystem-ready'); }
+  else if (state === 'connected') { btn.disabled = false; spinner.style.display = 'none'; btnText.textContent = 'Flash now'; btn.classList.add('flash-ready'); btn.classList.remove('filesystem-ready'); }
+  else if (state === 'filesystem') { btn.disabled = false; spinner.style.display = 'none'; btnText.textContent = 'Manage Files'; btn.classList.add('filesystem-ready'); btn.classList.remove('flash-ready'); }
+}
+
+async function handleConnect() {
+  const btn = $('connect-btn');
+  if (btn.classList.contains('flash-ready')) { startFlash(); return; }
+  if (btn.classList.contains('filesystem-ready')) { showScreen('screen-filesystem'); await connectFilesystem(); return; }
+  setError(null); setConnectState('waiting');
+  try {
+    port = await navigator.serial.requestPort();
+    transport = new Transport(port, true);
+    setConnectState('connected');
+  } catch (e) {
+    port = null; transport = null;
+    if (e.name === 'NotFoundError') setConnectState('select');
+    else { setError('Connection failed: ' + e.message); setConnectState('select'); }
+  }
+}
+
+async function startFlash() {
+  showScreen('screen-flash');
+  const progress = $('progress-bar'), progressText = $('progress-text'), board = selectedBoard;
+  try {
+    const esploader = new ESPLoader({ transport, baudrate: 460800, romBaudrate: 115200, terminal: { clean(){}, writeLine(d){console.log(d);}, write(d){console.log(d);} } });
+    progressText.textContent = 'Connecting to bootloader...';
+    await esploader.main();
+    await esploader.flashId();
+    const fileArray = []; let totalSize = 0;
+    for (const part of board.parts) {
+      progressText.textContent = 'Loading ' + part.path + '...';
+      const resp = await fetch(part.path);
+      if (!resp.ok) throw new Error('Failed to load ' + part.path + ': ' + resp.status);
+      const data = await resp.arrayBuffer();
+      const bytes = new Uint8Array(data);
+      fileArray.push({ data: binaryToStr(bytes), address: part.offset });
+      totalSize += bytes.length;
+    }
+    progressText.textContent = 'Flashing ' + (totalSize / 1024 / 1024).toFixed(1) + ' MB...';
+    await esploader.writeFlash({ fileArray, flashSize: board.flashSize, flashMode: 'dio', flashFreq: '80m', eraseAll: false, compress: true, reportProgress: (idx, written, total) => {
+      const pct = Math.round((written / total) * 100);
+      progress.style.width = pct + '%';
+      progressText.textContent = 'Flashing part ' + (idx + 1) + '/' + board.parts.length + '... ' + pct + '%';
+    }});
+    progressText.textContent = 'Resetting device...';
+    await transport.setDTR(false); await transport.setRTS(true);
+    await new Promise(r => setTimeout(r, 100));
+    await transport.setRTS(false);
+    await new Promise(r => setTimeout(r, 100));
+    showScreen('screen-success');
+  } catch (e) {
+    console.error('Flash error:', e); setError('Flash failed: ' + e.message);
+    setConnectState('select'); port = null; transport = null; showScreen('screen-connect');
+  }
+}
+
+function binaryToStr(u8) { let s=''; for(let i=0;i<u8.length;i++) s+=String.fromCharCode(u8[i]); return s; }
+
+function goBack() {
+  setError(null); disconnectFilesystem(); port=null; transport=null; selectedBoard=null;
+  const btn = $('connect-btn'); btn.classList.remove('flash-ready','filesystem-ready'); btn.disabled = true;
+  setConnectState('select'); showScreen('screen-board');
+}
+
+const encoder = new TextEncoder(), decoder = new TextDecoder();
+function stripAnsi(s) { return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g,'').replace(/\x1b\[\?[0-9;]*[A-Za-z]/g,'').replace(/\x1b[()][A-Za-z]/g,''); }
+async function startReading() { try { while(connected&&reader){const{value,done}=await reader.read();if(done)break;readBuffer+=decoder.decode(value,{stream:true});}}catch(e){console.error(e);} }
+async function sendRaw(d) { if(!writer)return; await writer.write(encoder.encode(d)); }
+async function sendCommand(c) { readBuffer=''; await sendRaw(c+'\r'); }
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+async function waitForPrompt(t=5000){const s=Date.now();while(Date.now()-s<t){if(stripAnsi(readBuffer).includes('>: ')){const r=readBuffer;readBuffer='';return stripAnsi(r);}await sleep(50);}const r=readBuffer;readBuffer='';return stripAnsi(r);}
+async function waitForString(str,t=5000){const s=Date.now();while(Date.now()-s<t){if(stripAnsi(readBuffer).includes(str))return true;await sleep(50);}return false;}
+
+async function listDir(path){if(!connected)return;currentPath=path;updateBreadcrumb();setFilesystemStatus('Loading...');await sendCommand('storage list '+path);const r=await waitForPrompt();setFilesystemStatus('Ready');const lines=r.split(/\r?\n/);const entries=[];for(const l of lines){const t=l.trim();const dm=t.match(/\[D\]\s+(.+)$/);const fm=t.match(/\[F\]\s+(.+?)\s+(\d+)b$/);if(dm)entries.push({name:dm[1],type:'dir',size:0});else if(fm)entries.push({name:fm[1],type:'file',size:parseInt(fm[2])});}renderFileList(entries);}
+
+async function downloadFile(path,filename,fileSize){if(!connected)return;setFilesystemStatus('Downloading '+filename+'...');const cs=512;readBuffer='';await sendCommand('storage read_chunks '+path+' '+cs);await waitForString('Size:',3000);await sleep(100);const sm=readBuffer.match(/Size:\s*(\d+)/);const size=sm?parseInt(sm[1]):fileSize;const chunks=[];let received=0;while(received<size){await waitForString('Ready?',5000);await sleep(50);readBuffer='';await sendRaw('\r');await sleep(100);const eb=Math.min(cs,size-received);const st=Date.now();while(readBuffer.length<eb&&Date.now()-st<5000){await sleep(50);}const cd=readBuffer.substring(0,eb);chunks.push(cd);received+=eb;readBuffer=readBuffer.substring(eb);setFilesystemStatus('Downloading '+filename+'... '+Math.round(received/size*100)+'%');}await waitForPrompt(3000);const fd=chunks.join('');const bytes=new Uint8Array(fd.length);for(let i=0;i<fd.length;i++)bytes[i]=fd.charCodeAt(i)&0xff;const blob=new Blob([bytes]);const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=filename;a.click();URL.revokeObjectURL(url);setFilesystemStatus('Downloaded '+filename+' ('+formatSize(size)+')');}
+
+async function uploadFile(){if(!connected)return;const input=document.createElement('input');input.type='file';input.multiple=true;input.onchange=async()=>{for(const f of input.files)await uploadSingleFile(f);await listDir(currentPath);};input.click();}
+async function uploadSingleFile(file){const rp=currentPath+'/'+file.name;setFilesystemStatus('Uploading '+file.name+'...');await sendCommand('storage remove '+rp);await waitForPrompt(3000);const data=new Uint8Array(await file.arrayBuffer());const ts=data.length;readBuffer='';await sendCommand('storage write_chunk '+rp+' '+ts);const ready=await waitForString('Ready',5000);if(!ready){setFilesystemError('Device did not respond with Ready');return;}await sleep(100);readBuffer='';const scs=512;let sent=0;while(sent<ts){const end=Math.min(sent+scs,ts);await writer.write(data.slice(sent,end));sent=end;setFilesystemStatus('Uploading '+file.name+'... '+Math.round(sent/ts*100)+'%');await sleep(20);}await waitForPrompt(10000);setFilesystemStatus('Uploaded '+file.name+' ('+formatSize(ts)+')');}
+
+async function createDir(){if(!connected)return;const name=prompt('Directory name:');if(!name)return;await sendCommand('storage mkdir '+currentPath+'/'+name);await waitForPrompt();await listDir(currentPath);}
+async function deleteEntry(name,type){if(!confirm('Delete '+(type==='dir'?'directory':'file')+' "'+name+'"?'))return;setFilesystemStatus('Deleting '+name+'...');await sendCommand('storage remove '+currentPath+'/'+name);await waitForPrompt();await listDir(currentPath);setFilesystemStatus('Deleted '+name);}
+
+function renderFileList(entries){const list=$('file-list');list.innerHTML='';if(currentPath!=='/ext'){const row=createFileRow('..','parent','');row.querySelector('.entry-name').onclick=()=>{const p=currentPath.substring(0,currentPath.lastIndexOf('/'))||'/ext';listDir(p);};list.appendChild(row);}entries.sort((a,b)=>{if(a.type!==b.type)return a.type==='dir'?-1:1;return a.name.localeCompare(b.name);});for(const e of entries){const row=createFileRow(e.name,e.type,e.type==='file'?formatSize(e.size):'');const ne=row.querySelector('.entry-name');if(e.type==='dir')ne.onclick=()=>listDir(currentPath+'/'+e.name);else ne.onclick=()=>downloadFile(currentPath+'/'+e.name,e.name,e.size);const eb=row.querySelector('.btn-edit');if(eb)eb.onclick=()=>editFile(currentPath+'/'+e.name,e.name);row.querySelector('.btn-delete').onclick=()=>deleteEntry(e.name,e.type);list.appendChild(row);}if(entries.length===0)list.innerHTML='<div class="empty">Empty directory</div>';}
+
+function createFileRow(name,type,size){const row=document.createElement('div');row.className='file-row';const icon=type==='dir'?'[DIR]':type==='parent'?'[UP]':'[FILE]';row.innerHTML='<span class="entry-icon">'+icon+'</span><span class="entry-name">'+escHtml(name)+'</span><span class="entry-size">'+size+'</span>'+(type==='file'?'<button class="btn-edit">EDIT</button>':'')+(type!=='parent'?'<button class="btn-delete">DEL</button>':'');return row;}
+
+function updateBreadcrumb(){const parts=currentPath.split('/').filter(Boolean);let html='',path='';for(let i=0;i<parts.length;i++){path+='/'+parts[i];if(i<parts.length-1)html+='<span class="crumb" onclick="window._nav(\''+path+'\')">'+escHtml(parts[i])+'</span> / ';else html+='<span class="crumb active">'+escHtml(parts[i])+'</span>';}$('breadcrumb').innerHTML=html;}
+function setFilesystemStatus(m){$('filesystem-status').textContent=m;$('filesystem-status').style.color='';}
+function setFilesystemError(m){$('filesystem-status').textContent=m;$('filesystem-status').style.color='#ff5555';setTimeout(()=>$('filesystem-status').style.color='',3000);}
+function formatSize(b){if(b<1024)return b+' B';if(b<1048576)return (b/1024).toFixed(1)+' KB';return (b/1048576).toFixed(1)+' MB';}
+function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+window._nav=(p)=>listDir(p);
+
+async function connectFilesystem(){if(!port){setError('No serial port. Connect first.');return;}try{setFilesystemStatus('Connecting...');if(transport)await transport.disconnect();transport=new Transport(port,false);reader=port.readable.getReader();writer=port.writable.getWriter();connected=true;startReading();await sleep(1000);await sendCommand('');await waitForPrompt(5000);setFilesystemStatus('Connected');await listDir('/ext');}catch(e){setFilesystemError('Failed: '+e.message);connected=false;}}
+async function disconnectFilesystem(){connected=false;if(reader){try{reader.releaseLock();}catch(e){}reader=null;}if(writer){try{writer.releaseLock();}catch(e){}writer=null;}}
+
+async function editFile(path,filename){if(!connected)return;setFilesystemStatus('Downloading '+filename+'...');const cs=512;readBuffer='';await sendCommand('storage read_chunks '+path+' '+cs);await waitForString('Size:',3000);await sleep(100);const sm=readBuffer.match(/Size:\s*(\d+)/);const size=sm?parseInt(sm[1]):0;const chunks=[];let received=0;while(received<size){await waitForString('Ready?',5000);await sleep(50);readBuffer='';await sendRaw('\r');await sleep(100);const eb=Math.min(cs,size-received);const st=Date.now();while(readBuffer.length<eb&&Date.now()-st<5000){await sleep(50);}chunks.push(readBuffer.substring(0,eb));received+=eb;readBuffer=readBuffer.substring(eb);}await waitForPrompt(3000);const content=chunks.join('');const nc=prompt('Edit file:',content);if(nc===null)return;setFilesystemStatus('Saving...');await sendCommand('storage remove '+path);await waitForPrompt(3000);const data=encoder.encode(nc);const ts=data.length;readBuffer='';await sendCommand('storage write_chunk '+path+' '+ts);if(!await waitForString('Ready',5000)){setFilesystemError('No Ready response');return;}await sleep(100);readBuffer='';const scs=512;let sent=0;while(sent<ts){await writer.write(data.slice(sent,Math.min(sent+scs,ts)));sent=Math.min(sent+scs,ts);await sleep(20);}await waitForPrompt(10000);setFilesystemStatus('Saved');await listDir(currentPath);}
+</script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:#0a0a0a;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;display:flex;justify-content:center;align-items:center;overflow-x:hidden;}
+.container{max-width:480px;width:100%;padding:40px 24px;text-align:center;z-index:1;position:relative;}
+h1{font-size:2rem;font-weight:700;color:#fff;margin-bottom:4px;letter-spacing:-0.02em;}
+.subtitle{color:#ff8c00;font-size:0.95rem;margin-bottom:32px;font-weight:500;}
+#error-banner{display:none;background:#2a0a0a;border:1px solid #ff5555;color:#ff5555;padding:12px 16px;border-radius:8px;margin-bottom:20px;font-size:0.85rem;text-align:left;}
+.screen{display:none;}.screen.active{display:block;}
+.board-heading{color:#999;font-size:1rem;margin-bottom:24px;}
+.board-cards{display:flex;flex-direction:column;gap:14px;}
+.board-card{background:#141414;border:2px solid #2a2a2a;border-radius:14px;padding:20px 24px;cursor:pointer;transition:all 0.2s;text-align:left;display:flex;align-items:center;gap:18px;}
+.board-card:hover{border-color:#ff8c00;background:#1a1400;}
+.board-card.selected{border-color:#ff8c00;background:#1a1400;}
+.board-icon{font-size:2rem;flex-shrink:0;}
+.board-info h3{font-size:1rem;font-weight:600;color:#e0e0e0;margin-bottom:4px;}
+.board-info p{font-size:0.8rem;color:#666;}
+.connect-text{color:#999;font-size:1rem;margin-bottom:32px;line-height:1.5;}
+.btn{display:inline-flex;align-items:center;gap:10px;background:#ff8c00;color:#000;font-size:1.1rem;font-weight:600;padding:16px 48px;border:none;border-radius:14px;cursor:pointer;transition:all 0.2s;min-width:260px;justify-content:center;}
+.btn:hover:not(:disabled){background:#ff9f2e;transform:scale(1.02);}
+.btn:disabled{background:#333;color:#666;cursor:not-allowed;transform:none;}
+.btn.flash-ready{background:#00c853;color:#000;}
+.btn.flash-ready:hover{background:#2ee06a;}
+.btn-back{display:inline-block;background:none;border:none;color:#666;font-size:0.85rem;cursor:pointer;margin-top:20px;padding:6px 12px;transition:color 0.2s;}
+.btn-back:hover{color:#ff8c00;}
+.spinner{display:none;width:20px;height:20px;border:3px solid rgba(0,0,0,0.2);border-top-color:#000;border-radius:50%;animation:spin 0.8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.chip{display:inline-block;background:#1a1a1a;border:1px solid #2a2a2a;padding:6px 14px;border-radius:20px;font-size:0.78rem;color:#666;margin-top:20px;}
+.flash-info{color:#bbb;font-size:0.95rem;margin-bottom:8px;line-height:1.5;}
+.flash-warning{color:#cc8800;font-size:0.82rem;margin-bottom:32px;}
+.progress-container{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:12px;height:28px;overflow:hidden;margin-bottom:16px;}
+.progress-fill{height:100%;background:linear-gradient(90deg,#ff8c00,#ffb347);width:0%;transition:width 0.3s ease;border-radius:12px;}
+#progress-text{color:#888;font-size:0.85rem;}
+.success-icon{font-size:3rem;color:#00c853;margin-bottom:12px;}
+.success-text{color:#fff;font-size:1.5rem;font-weight:700;margin-bottom:8px;}
+.success-sub{color:#999;font-size:0.9rem;line-height:1.5;margin-bottom:24px;}
+#screen-filesystem h2{color:#ff8c00;margin-bottom:16px;font-size:1.5rem;}
+#filesystem-status{color:#888;font-size:0.85rem;margin-bottom:16px;min-height:1.2em;}
+#breadcrumb{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;padding:8px 12px;margin-bottom:16px;font-size:0.85rem;text-align:left;}
+.crumb{color:#ff8c00;cursor:pointer;padding:2px 4px;border-radius:4px;}
+.crumb:hover{background:#2a2a2a;}
+.crumb.active{color:#e0e0e0;cursor:default;}
+.crumb.active:hover{background:none;}
+#file-list{background:#1a1a1a;border:1px solid #2a2a2a;border-radius:8px;max-height:300px;overflow-y:auto;margin-bottom:16px;}
+.file-row{display:flex;align-items:center;padding:8px 12px;border-bottom:1px solid #2a2a2a;cursor:pointer;transition:background 0.2s;}
+.file-row:hover{background:#2a2a2a;}
+.file-row:last-child{border-bottom:none;}
+.entry-icon{font-size:0.75rem;margin-right:12px;flex-shrink:0;color:#666;font-family:monospace;}
+.entry-name{flex:1;font-size:0.9rem;color:#e0e0e0;}
+.entry-size{font-size:0.8rem;color:#888;margin-right:12px;flex-shrink:0;}
+.btn-edit,.btn-delete{background:none;border:none;color:#666;cursor:pointer;padding:4px 8px;border-radius:4px;font-size:0.75rem;margin-left:4px;transition:all 0.2s;font-weight:600;}
+.btn-edit:hover{color:#ff8c00;background:#2a2a2a;}
+.btn-delete:hover{color:#ff5555;background:#2a2a2a;}
+.empty{padding:20px;color:#666;font-style:italic;text-align:center;}
+.filesystem-controls{display:flex;gap:12px;margin-bottom:20px;flex-wrap:wrap;}
+.filesystem-controls button{background:#2a2a2a;border:1px solid #3a3a3a;color:#e0e0e0;padding:8px 16px;border-radius:6px;cursor:pointer;font-size:0.85rem;transition:all 0.2s;}
+.filesystem-controls button:hover{background:#3a3a3a;border-color:#ff8c00;}
+.stars{position:fixed;width:100%;height:100%;pointer-events:none;}
+.star{position:absolute;width:2px;height:2px;background:white;border-radius:50%;opacity:0;animation:twinkle linear infinite;}
+@keyframes twinkle{0%{opacity:0;}50%{opacity:0.6;}100%{opacity:0;}}
+.browser-warn{background:#2a1a00;border:1px solid #cc8800;color:#cc8800;padding:10px 16px;border-radius:8px;margin-bottom:20px;font-size:0.8rem;}
+</style>
+</head>
+<body>
+<div class="stars" id="stars"></div>
+<script>
+(function(){const c=document.getElementById("stars");const n=150;const cx=window.innerWidth/2,cy=window.innerHeight/2,r=180;for(let i=0;i<n;i++){let x,y;do{x=Math.random()*window.innerWidth;y=Math.random()*window.innerHeight;}while(Math.hypot(x-cx,y-cy)<r);const s=document.createElement("div");s.className="star";s.style.left=x+"px";s.style.top=y+"px";s.style.animationDuration=(2+Math.random()*3)+"s";s.style.animationDelay=(Math.random()*5)+"s";c.appendChild(s);}if(!('serial'in navigator))document.getElementById('browser-warn').style.display='block';})();
+</script>
+<div class="container">
+  <h1>T-Embed Flasher</h1>
+  <p class="subtitle">Momentum Firmware &bull; ESP32-S3</p>
+  <div id="browser-warn" class="browser-warn" style="display:none;">Web Serial not supported. Use Chrome or Edge on desktop.</div>
+  <div id="error-banner"></div>
+  <div id="screen-board" class="screen active">
+    <p class="board-heading">Your board</p>
+    <div class="board-cards">
+      <div id="board-t-embed" class="board-card selected" onclick="selectBoard('t-embed')">
+        <div class="board-icon">&#9881;</div>
+        <div class="board-info"><h3>LilyGo T-Embed CC1101</h3><p>ESP32-S3 &bull; NFC &bull; IR &bull; SubGHz &bull; WiFi</p></div>
+      </div>
+    </div>
+    <p style="color:#555;font-size:0.78rem;margin-top:24px;">Firmware: m0lomalteser/Flipper-Zero-ESP32-Port (Momentum)<br>Commit: 9597c9e</p>
+  </div>
+  <div id="screen-connect" class="screen">
+    <p id="connect-info" class="connect-text">Connect your T-Embed via USB to get started.</p>
+    <button id="connect-btn" class="btn" disabled onclick="handleConnect()"><span id="connect-spinner" class="spinner"></span><span id="connect-text">Select device</span></button>
+    <div id="connect-chip" class="chip"></div><br>
+    <button class="btn-back" onclick="goBack()">&larr; Back</button>
+  </div>
+  <div id="screen-flash" class="screen">
+    <p class="flash-info">Uploading firmware to device...</p>
+    <p class="flash-warning">Do not disconnect the USB cable.</p>
+    <div class="progress-container"><div id="progress-bar" class="progress-fill"></div></div>
+    <p id="progress-text">Preparing...</p>
+  </div>
+  <div id="screen-success" class="screen">
+    <div class="success-icon">&#10003;</div>
+    <div class="success-text">Flashed!</div>
+    <p class="success-sub">Momentum firmware installed successfully.<br>Your T-Embed is rebooting.</p><br>
+    <div style="display:flex;gap:12px;flex-direction:column;">
+      <button class="btn" onclick="setConnectState('filesystem');showScreen('screen-connect');">Manage SD Card Files</button>
+      <button class="btn-back" onclick="goBack()">&larr; Flash Again</button>
+    </div>
+  </div>
+  <div id="screen-filesystem" class="screen">
+    <h2>SD Card Filesystem</h2>
+    <div id="filesystem-status">Not connected</div>
+    <div id="breadcrumb"></div>
+    <div id="file-list"></div>
+    <div class="filesystem-controls"><button onclick="uploadFile()">UPLOAD</button><button onclick="createDir()">NEW DIR</button><button onclick="listDir(currentPath)">REFRESH</button></div>
+    <br><button class="btn-back" onclick="disconnectFilesystem();goBack();">&larr; Back</button>
+  </div>
+</div>
+</body>
+</html>
